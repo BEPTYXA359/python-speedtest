@@ -12,6 +12,7 @@
 
 import argparse
 import ipaddress
+import math
 import shutil
 import socket
 import sys
@@ -38,7 +39,7 @@ DEFAULT_SIZE_MB = 25.0
 #: Единицы скорости: сколько байт/с в одной единице (десятичные SI,
 #: 1 байт = 8 бит, 1 МБ = 10^6 байт, 1 Мбит = 10^6 бит).
 UNIT_FACTORS = {
-    "bps": 1,          # байт в секунду — сырая база
+    "Bps": 1,          # байт в секунду — сырая база (B — байты, не биты)
     "kbs": 1_000,      # КБ/с = 10^3 байт/с
     "mbs": 1_000_000,  # МБ/с = 10^6 байт/с
     "mbps": 125_000,   # Мбит/с = 10^6 бит/с = 125 000 байт/с
@@ -63,13 +64,13 @@ def _thousands(value: int) -> str:
 
 # --- Чистые функции без побочных эффектов ---
 
-def average(times) -> float:
+def average(times: Sequence[float]) -> float:
     """Среднее арифметическое по списку; 0.0 для пустого списка."""
     return sum(times) / len(times) if times else 0.0
 
 
 def convert_speed(value: float, source: str, target: str) -> float:
-    """Переводит значение скорости между единицами bps/kbs/mbs/mbps."""
+    """Переводит значение скорости между единицами Bps/kbs/mbs/mbps."""
     if source not in UNIT_FACTORS or target not in UNIT_FACTORS:
         raise ValueError(f"неизвестная единица скорости: {source!r} или {target!r}")
     if source == target:
@@ -82,7 +83,7 @@ def speed(nbytes: int, seconds: float, unit: str = "mbs") -> float:
     """Скорость скачивания (байты, секунды) → значение в единице unit."""
     if seconds <= 0:
         return 0.0
-    return convert_speed(nbytes / seconds, "bps", unit)
+    return convert_speed(nbytes / seconds, "Bps", unit)
 
 
 def summary_data(count: int, total_bytes: int,
@@ -112,7 +113,7 @@ def with_size(url: str, size_mb: float) -> str:
     """Заменяет или добавляет query-параметр bytes=size_mb * 10^6.
 
     Актуально для Cloudflare-адреса; чужой сервер лишний параметр
-    проигнорирует.
+    проигнорирует. Синтаксически неверный url — ValueError от urlsplit.
     """
     scheme, netloc, path, query, fragment = urllib.parse.urlsplit(url)
     params = urllib.parse.parse_qs(query, keep_blank_values=True)
@@ -386,12 +387,12 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     if args.requests < 1:
         parser.error("значение -n/--requests должно быть не меньше 1")
-    if args.timeout <= 0:
-        parser.error("значение --timeout должно быть больше 0")
-    if args.size < 1:
-        parser.error("значение --size должно быть не меньше 1")
-    url = with_size(args.url, args.size)
+    if not math.isfinite(args.timeout) or args.timeout <= 0:
+        parser.error("значение --timeout должно быть конечным числом больше 0")
+    if not math.isfinite(args.size) or args.size < 1:
+        parser.error("значение --size должно быть конечным числом не меньше 1")
     try:
+        url = with_size(args.url, args.size)
         _run(url, args.requests, args.timeout, args.unit,
              progress=not args.no_progress)
     except KeyboardInterrupt:

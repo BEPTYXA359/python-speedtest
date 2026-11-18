@@ -4,7 +4,9 @@
     python3 -m unittest discover -s tests -v
 """
 
+import contextlib
 import http.server
+import io
 import threading
 import unittest
 import unittest.mock
@@ -138,6 +140,9 @@ class ConvertSpeedTests(unittest.TestCase):
     def test_mbps_to_kbs(self):
         self.assertAlmostEqual(speedtest.convert_speed(8.0, "mbps", "kbs"), 1000.0)
 
+    def test_Bps_to_kbs(self):
+        self.assertAlmostEqual(speedtest.convert_speed(500.0, "Bps", "kbs"), 0.5)
+
     def test_same_unit_identity(self):
         self.assertAlmostEqual(speedtest.convert_speed(3.14, "mbs", "mbs"), 3.14)
 
@@ -253,6 +258,44 @@ class SummaryDataTests(unittest.TestCase):
         self.assertEqual(data["avg_seconds"], 0.0)
         self.assertEqual(data["speed"], 0.0)
         self.assertEqual(data["speed_extra"], 0.0)
+
+
+class MainExitCodeTests(unittest.TestCase):
+    """Коды выхода main() на плохом вводе: контракт README.
+
+    Неверные аргументы — SystemExit(2) от argparse (включая nan/inf
+    в числовых флагах); битый URL и запрещённые адреса — чистый
+    код 1 с сообщением в stderr, без traceback'а.
+    """
+
+    def _expect_argparse_error(self, argv):
+        """main(argv) должен упасть с argparse-ошибкой (код выхода 2)."""
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as ctx:
+                speedtest.main(argv)
+        self.assertEqual(ctx.exception.code, 2)
+
+    def _run_main(self, argv):
+        """main(argv) с заглушённым stderr: сообщение не шумит в выводе."""
+        with contextlib.redirect_stderr(io.StringIO()):
+            return speedtest.main(argv)
+
+    def test_size_inf_rejected(self):
+        self._expect_argparse_error(["--size", "inf"])
+
+    def test_size_nan_rejected(self):
+        self._expect_argparse_error(["--size", "nan"])
+
+    def test_timeout_nan_rejected(self):
+        self._expect_argparse_error(["--timeout", "nan"])
+
+    def test_malformed_url_clean_exit(self):
+        # раньше: ValueError из urlsplit в with_size падал traceback'ом
+        self.assertEqual(self._run_main(["http://[::1"]), 1)
+
+    def test_loopback_url_clean_exit(self):
+        # защита _validate_url: локальный адрес — чистый код 1
+        self.assertEqual(self._run_main(["http://127.0.0.1/x"]), 1)
 
 
 if __name__ == "__main__":
