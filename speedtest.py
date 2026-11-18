@@ -19,7 +19,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Callable, Optional, Tuple
+from typing import Callable, Optional, Sequence, Tuple
 
 #: Некоторые CDN отклоняют запросы с дефолтным User-Agent питона.
 USER_AGENT = "speedtest.py/1.0"
@@ -83,6 +83,29 @@ def speed(nbytes: int, seconds: float, unit: str = "mbs") -> float:
     if seconds <= 0:
         return 0.0
     return convert_speed(nbytes / seconds, "bps", unit)
+
+
+def summary_data(count: int, total_bytes: int,
+                 request_times: Sequence[float], unit: str = "mbs") -> dict:
+    """Итоговые метрики замера как словарь (сырые значения, без округления).
+
+    Печатный блок в _run строится из этого словаря; будущий --json
+    сможет отдавать его как есть.
+    """
+    total_seconds = sum(request_times)
+    # Дубль в скобках: Мбит/с, если она не основная; иначе МБ/с.
+    extra_unit = "mbps" if unit != "mbps" else "mbs"
+    return {
+        "requests": count,
+        "total_bytes": total_bytes,
+        "total_mb": total_bytes / MB,
+        "total_seconds": total_seconds,
+        "avg_seconds": average(request_times),
+        "speed": speed(total_bytes, total_seconds, unit),
+        "unit": unit,
+        "speed_extra": speed(total_bytes, total_seconds, extra_unit),
+        "unit_extra": extra_unit,
+    }
 
 
 def with_size(url: str, size_mb: float) -> str:
@@ -305,20 +328,18 @@ def _run(url: str, count: int, timeout: float, unit: str = "mbs",
         request_times.append(seconds)
         print(f"запрос {index:>{index_width}}/{count}: "
               f"{seconds:.3f} с, {nbytes / MB:.2f} МБ")
-    total_seconds = sum(request_times)
-    # Дубль в скобках: Мбит/с, если она не основная; иначе МБ/с.
-    extra_unit = "mbps" if unit != "mbps" else "mbs"
+    summary = summary_data(count, total_bytes, request_times, unit)
     print()
     print("Итог:")
-    print(f"  {'запросов:':<15} {count}")
+    print(f"  {'запросов:':<15} {summary['requests']}")
     print(f"  {'всего скачано:':<15} "
-          f"{_thousands(total_bytes)} байт ({total_bytes / MB:.2f} МБ)")
-    print(f"  {'общее время:':<15} {total_seconds:.3f} с")
-    print(f"  {'среднее время:':<15} {average(request_times):.3f} с")
+          f"{_thousands(summary['total_bytes'])} байт "
+          f"({summary['total_mb']:.2f} МБ)")
+    print(f"  {'общее время:':<15} {summary['total_seconds']:.3f} с")
+    print(f"  {'среднее время:':<15} {summary['avg_seconds']:.3f} с")
     print(f"  {'скорость:':<15} "
-          f"{speed(total_bytes, total_seconds, unit):.2f} {UNIT_LABELS[unit]} "
-          f"({speed(total_bytes, total_seconds, extra_unit):.2f} "
-          f"{UNIT_LABELS[extra_unit]})")
+          f"{summary['speed']:.2f} {UNIT_LABELS[summary['unit']]} "
+          f"({summary['speed_extra']:.2f} {UNIT_LABELS[summary['unit_extra']]})")
 
 
 def _build_parser() -> argparse.ArgumentParser:
