@@ -12,13 +12,14 @@
 
 import argparse
 import ipaddress
+import shutil
 import socket
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Tuple
+from typing import Callable, Optional, Tuple
 
 #: Некоторые CDN отклоняют запросы с дефолтным User-Agent питона.
 USER_AGENT = "speedtest.py/1.0"
@@ -90,12 +91,104 @@ def with_size(url: str, size_mb: float) -> str:
     Актуально для Cloudflare-адреса; чужой сервер лишний параметр
     проигнорирует.
     """
-    parts = urllib.parse.urlsplit(url)
-    query = urllib.parse.parse_qs(parts.query, keep_blank_values=True)
-    query["bytes"] = [str(int(round(size_mb * MB)))]
+    scheme, netloc, path, query, fragment = urllib.parse.urlsplit(url)
+    params = urllib.parse.parse_qs(query, keep_blank_values=True)
+    params["bytes"] = [str(int(round(size_mb * MB)))]
     return urllib.parse.urlunsplit(
-        parts._replace(query=urllib.parse.urlencode(query, doseq=True))
+        (scheme, netloc, path, urllib.parse.urlencode(params, doseq=True), fragment)
     )
+
+
+def progress_line(current_bytes: int, total_bytes: Optional[int],
+                  request_index: int, total_requests: int,
+                  speed_value: float, width: int, unit: str = "mbs") -> str:
+    """Строка прогрессбара для одного запроса, например:
+
+        3/10 [#######.....]  45%  12.3 МБ/с
+
+    speed_value — скорость, уже пересчитанная в единицу unit.
+    total_bytes=None (нет Content-Length) → без бара и процентов:
+    только скачанные МБ и текущая скорость.
+    """
+    prefix = f"{request_index}/{total_requests}"
+    tail = f"{speed_value:.1f} {UNIT_LABELS[unit]}"
+    if total_bytes:
+        fraction = min(current_bytes / total_bytes, 1.0)
+        filled = round(width * fraction)
+        bar = "#" * filled + "." * (width - filled)
+        percent = round(100.0 * fraction)
+        return f"{prefix} [{bar}] {percent:>3}%  {tail}"
+    return f"{prefix}  {current_bytes / MB:.2f} МБ  {tail}"
+
+
+class ProgressPrinter:
+    """Рисует прогрессбар в stderr: одна строка на запрос, перерисовка \\r.
+
+    Без ANSI-кодов (работает и в Windows). Рисуется только когда stderr —
+    терминал и прогресс не отключён флагом --no-progress; перерисовка
+    не чаще REDRAW_INTERVAL, чтобы отрисовка не искажала замер.
+    """
+
+    #: Минимальный интервал между перерисовками (~10 раз/с).
+    REDRAW_INTERVAL = 0.1
+
+    def __init__(self, total_requests: int, unit: str = "mbs",
+                 enabled: bool = True):
+        self.total_requests = total_requests
+        self.unit = unit
+        self.enabled = enabled and sys.stderr.isatty()
+        # Запас под "N/M [", "] 100%" и " 999.9 Мбит/с".
+        self.width = max(10, shutil.get_terminal_size().columns - 28)
+        self._index = 0
+        self._start_time = None
+        self._last_draw = 0.0
+        self._drawn_len = 0
+
+    def start_request(self, index: int) -> None:
+        """Сбрасывает состояние перед очередным запросом."""
+        self._index = index
+        self._start_time = None
+        self._last_draw = 0.0
+
+    def update(self, current_bytes: int, total_bytes: Optional[int]) -> None:
+        """Колбэк на каждый чанк; сам решает, пора ли перерисовать."""
+        if not self.enabled:
+            return
+        now = time.perf_counter()
+        if self._start_time is None:
+            # Первый чанк: запоминаем точку отсчёта, пока не рисуем —
+            # текущая скорость ещё неосмысленна.
+            self._start_time = now
+            self._last_draw = now
+            return
+        if now - self._last_draw < self.REDRAW_INTERVAL:
+            return
+        self._last_draw = now
+        elapsed = max(now - self._start_time, 1e-9)
+        value = speed(current_bytes, elapsed, self.unit)
+        self._draw(progress_line(current_bytes, total_bytes, self._index,
+                                 self.total_requests, value, self.width,
+                                 self.unit))
+
+    def finish_request(self) -> None:
+        """Стирает строку бара, чтобы результат запроса лёг с чистой строки."""
+        if self.enabled and self._drawn_len:
+            sys.stderr.write("\r" + " " * self._drawn_len + "\r")
+            sys.stderr.flush()
+        self._drawn_len = 0
+
+    def interrupt(self) -> None:
+        """После Ctrl+C: перевод строки, чтобы недорисованный бар
+        не слипся с сообщением об остановке."""
+        if self.enabled and self._drawn_len:
+            sys.stderr.write("\n")
+            sys.stderr.flush()
+        self._drawn_len = 0
+
+    def _draw(self, line: str) -> None:
+        sys.stderr.write("\r" + line)
+        sys.stderr.flush()
+        self._drawn_len = len(line)
 
 
 def _validate_url(url: str) -> None:
@@ -108,7 +201,7 @@ def _validate_url(url: str) -> None:
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme not in ("http", "https"):
         raise ValueError(
-            f"некорректный URL {url!r}: схема должна быть http:// или https://"
+            f"некорректный URL {url!r}: схема должна быть http или https"
         )
     hostname = parsed.hostname
     if not hostname:
@@ -140,7 +233,9 @@ class _ValidatingRedirectHandler(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, hdrs, newurl)
 
 
-def download(url: str, timeout: float) -> Tuple[int, float]:
+def download(url: str, timeout: float,
+             on_progress: Optional[Callable[[int, Optional[int]], None]] = None
+             ) -> Tuple[int, float]:
     """Скачивает ``url`` и возвращает пару (число байт, секунды).
 
     - Тело читается блоками по CHUNK_SIZE байт и не копится в памяти целиком.
@@ -148,6 +243,8 @@ def download(url: str, timeout: float) -> Tuple[int, float]:
       это данные, реально пришедшие по сети без сжатия.
     - Время замеряется time.perf_counter() от создания запроса до конца
       тела ответа; время автоматических редиректов входит в замер.
+    - on_progress, если задан, вызывается после каждого чанка с аргументами
+      (скачано_байт_всего, total_байт_или_None); на результат не влияет.
     """
     _validate_url(url)
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
@@ -158,29 +255,46 @@ def download(url: str, timeout: float) -> Tuple[int, float]:
             status = response.getcode()
             if status is None or not 200 <= status < 300:
                 raise SpeedtestError(f"HTTP {status} для {url}")
+            try:
+                total_bytes = int(response.headers["Content-Length"])
+            except (KeyError, TypeError, ValueError):
+                total_bytes = None
             downloaded = 0
             while True:
                 chunk = response.read(CHUNK_SIZE)
                 if not chunk:
                     break
                 downloaded += len(chunk)
+                if on_progress is not None:
+                    on_progress(downloaded, total_bytes)
     finally:
         elapsed = time.perf_counter() - start
     return downloaded, elapsed
 
 
-def _run(url: str, count: int, timeout: float, unit: str = "mbs") -> None:
+def _run(url: str, count: int, timeout: float, unit: str = "mbs",
+         progress: bool = True) -> None:
     """Выполняет замер: построчный прогресс и итоговый блок."""
     _validate_url(url)  # быстрый отказ до печати шапки
     print(f"URL:       {url}")
     print(f"Запросов:  {count}, таймаут сетевых операций: {timeout:g} с")
     print()
+    bar = ProgressPrinter(count, unit, enabled=progress)
     index_width = len(str(count))
     total_bytes = 0
     request_times = []
     for index in range(1, count + 1):
+        bar.start_request(index)
         try:
-            nbytes, seconds = download(url, timeout)
+            try:
+                nbytes, seconds = download(url, timeout, on_progress=bar.update)
+            except KeyboardInterrupt:
+                bar.interrupt()
+                raise
+            except Exception:
+                bar.finish_request()
+                raise
+            bar.finish_request()
         except urllib.error.HTTPError as exc:
             raise SpeedtestError(
                 f"HTTP {exc.code} ({exc.reason}) для {url}"
@@ -238,6 +352,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="единица скорости в итоге: mbs — МБ/с (по умолчанию), "
              "mbps — Мбит/с, kbs — КБ/с",
     )
+    parser.add_argument(
+        "--no-progress", action="store_true",
+        help="не рисовать прогрессбар (он и так не рисуется, "
+             "если stderr — не терминал)",
+    )
     return parser
 
 
@@ -252,7 +371,8 @@ def main(argv=None) -> int:
         parser.error("значение --size должно быть не меньше 1")
     url = with_size(args.url, args.size)
     try:
-        _run(url, args.requests, args.timeout, args.unit)
+        _run(url, args.requests, args.timeout, args.unit,
+             progress=not args.no_progress)
     except KeyboardInterrupt:
         print("Прервано пользователем (Ctrl+C)", file=sys.stderr)
         return 130
